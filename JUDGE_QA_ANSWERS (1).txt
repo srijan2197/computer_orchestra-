@@ -1,0 +1,982 @@
+================================================================================
+ CROSS-DOMAIN SOFTWARE ORCHESTRATION LAYER
+ Judge / Q&A Preparation — Answer Sheet
+================================================================================
+
+HOW TO USE THIS DOCUMENT
+------------------------
+Every answer below is grounded in the actual code in this repository:
+  - backend/core/catalog.py    -> shared platform + 12 automotive workloads
+  - backend/core/models.py      -> WorkloadSpec, RuntimeWorkload, ASIL weights
+  - backend/core/scheduler.py   -> adaptive safety-aware scheduler
+  - backend/core/simulator.py   -> real-time tick engine (1 Hz), scenarios, spikes
+  - backend/core/predictor.py   -> AI demand forecaster (Holt double-EWMA)
+  - backend/main.py             -> FastAPI + WebSocket streaming API
+  - frontend/                   -> React + Vite + Recharts live dashboard
+
+KEY SYSTEM FACTS (memorise these numbers):
+  - Shared platform capacity (abstract Compute Units, CU):
+        CPU = 900 CU, GPU = 800 CU, NPU = 1200 CU
+  - 12 workloads across ADAS / Cockpit / Infotainment / Connectivity
+  - Safety levels used: ASIL-D, C, B, A and QM
+  - ASIL reserve band (default): 70% of every resource guaranteed to ASIL
+  - Scheduler cadence: every simulation tick = 1 second (1 Hz), reallocated fully
+  - Transport: WebSocket /ws streaming live JSON snapshots at 1 Hz
+  - AI model: Holt linear-trend double exponential smoothing (alpha=0.4, beta=0.3)
+
+
+================================================================================
+ 1. PROBLEM UNDERSTANDING
+================================================================================
+
+1. What problem are you solving?
+   Modern vehicles are consolidating dozens of applications (ADAS, cockpit,
+   infotainment, connectivity) onto ONE shared high-performance compute (HPC)
+   platform. These apps have mixed criticality: safety-critical (ASIL) apps must
+   never miss deadlines, while best-effort (QM) apps like media/OTA compete for
+   the same CPU/GPU/NPU. We built an orchestration layer that dynamically and
+   safely shares compute so ASIL workloads are always protected while overall
+   hardware utilisation stays high.
+
+2. Why is static resource allocation inefficient?
+   Static allocation hard-partitions the SoC (e.g. fixed core/GPU slices per app)
+   sized for each app's WORST case. Most of the time apps run below worst case,
+   so reserved-but-idle capacity is wasted. It also can't adapt: when a scenario
+   changes (e.g. emergency braking), a statically-capped safety app can't borrow
+   the idle capacity it suddenly needs. You over-provision hardware AND still risk
+   deadline misses.
+
+3. What is a cross-domain software orchestration layer?
+   A software control plane that sits between the vehicle applications and the
+   shared silicon. It continuously measures each workload's demand, applies a
+   safety-aware scheduling policy, and allocates CPU/GPU/NPU across domains
+   (ADAS, cockpit, infotainment...) in real time — enforcing freedom-from-
+   interference between safety levels while maximising utilisation.
+
+4. Why are centralized vehicle compute platforms becoming popular?
+   Fewer, more powerful compute units replace 100+ distributed ECUs, reducing
+   wiring, weight, cost and complexity. They enable Software-Defined Vehicles:
+   features become software you can update over-the-air, and spare compute can be
+   monetised. But consolidation creates the mixed-criticality sharing problem this
+   project solves.
+
+5. What challenges arise when multiple applications share the same hardware?
+   Resource contention (two apps want the same GPU), interference (a greedy QM app
+   starving a safety app), latency/jitter spikes, deadline misses, and safety
+   certification difficulty (you must prove the infotainment app can't affect
+   emergency braking). Our layer addresses all of these via priority ordering plus
+   an ASIL capacity reserve.
+
+6. Why is dynamic resource allocation needed?
+   Vehicle load is highly non-stationary — it depends on driving scenario (city,
+   highway, parking, emergency). Emergency braking needs a burst of NPU/CPU
+   instantly; parking needs GPU for surround-view. Dynamic allocation shifts
+   capacity to where it's needed each tick, giving both high utilisation and
+   deadline safety that static schemes cannot.
+
+7. What happens when compute resources become overloaded?
+   Our scheduler degrades gracefully: it serves workloads in strict safety-then-
+   priority order, so ASIL apps get full allocation first. QM apps are THROTTLED
+   (given a reduced service ratio), not the safety apps. The simulator raises a
+   "<resource> saturated ... QM workloads throttled" alert and marks safety status
+   DEGRADED (QM missed a deadline) rather than VIOLATION (ASIL protected).
+
+8. How does your solution improve resource utilisation?
+   Instead of reserving worst-case slices, we pool all capacity and greedily hand
+   it out every tick based on live demand. Idle capacity from one domain is
+   immediately reused by another (subject to the ASIL reserve), so the platform
+   runs closer to its true limit while still guaranteeing safety headroom.
+
+9. Why can't traditional scheduling mechanisms solve this problem?
+   Classic OS schedulers (Round Robin, CFS) are fairness/throughput oriented and
+   criticality-agnostic — they can let a QM app steal time from an ASIL app. Pure
+   real-time schedulers (RMS/EDF) handle deadlines on ONE CPU but don't reason
+   about heterogeneous CPU+GPU+NPU pools, cross-domain freedom-from-interference,
+   or scenario-driven demand. We combine safety weighting + priority + deadline
+   urgency across all three resource pools.
+
+10. What are the limitations of your approach?
+    It is a simulation/orchestration-policy prototype: it models demand and uses a
+    queueing latency model rather than running real containers on real silicon. It
+    assumes demand is measurable and the platform is trusted. The AI predictor is a
+    lightweight statistical model (not a deep net). In production you'd bind it to a
+    real hypervisor/cgroups enforcement layer and certified timing analysis.
+
+
+================================================================================
+ 2. AUTOMOTIVE DOMAIN
+================================================================================
+
+SDV & Vehicle Architecture
+
+1. What is a Software Defined Vehicle (SDV)?
+   A vehicle whose features are primarily defined and upgraded through software on
+   centralised compute, decoupled from fixed hardware. Functions can be added,
+   improved, or monetised via OTA updates over the vehicle's life.
+
+2. What is a domain controller?
+   A powerful ECU that consolidates a functional domain (e.g. ADAS, cockpit, body)
+   that used to be many small ECUs. Our catalog mirrors this — workloads are tagged
+   by domain: ADAS, Cockpit, Infotainment, Connectivity.
+
+3. What is a zonal architecture?
+   Compute organised by physical ZONE of the car (front-left, rear...) rather than
+   by function. Zone controllers aggregate local sensors/actuators and connect to
+   central HPCs over high-speed Ethernet, cutting wiring. Our shared SoC represents
+   such a central HPC.
+
+4. What is centralized compute architecture?
+   A few high-performance compute units run most vehicle software, versus dozens of
+   distributed single-function ECUs. This is exactly the shared platform our
+   orchestrator manages (CPU=900, GPU=800, NPU=1200 CU).
+
+5. Why are vehicles moving from ECU-based systems to centralized compute?
+   Cost/weight/wiring reduction, easier OTA updates, more compute for AI/ADAS,
+   simpler integration, and the ability to reallocate spare compute. The trade-off
+   is the mixed-criticality sharing challenge we solve.
+
+6. How many applications can run on a modern vehicle computer?
+   Dozens to hundreds. Our demo runs 12 representative workloads spanning all major
+   domains, which is enough to demonstrate contention and safety isolation.
+
+7. What vehicle domains are involved in your solution?
+   - ADAS: AEB, ACC, Lane Keeping, Sensor Fusion, Surround-View/Parking
+   - Cockpit: Driver Monitoring, Digital Instrument Cluster
+   - Infotainment: Navigation, Media, Voice Assistant, Connected Apps
+   - Connectivity: OTA Update Agent
+   These map to Autonomous/ADAS, Infotainment, Telematics/Connectivity and Body/
+   Cockpit categories.
+
+
+================================================================================
+ 3. FUNCTIONAL SAFETY (ISO 26262)
+================================================================================
+
+1. What is ISO 26262?
+   The international standard for functional safety of electrical/electronic
+   systems in road vehicles. It defines a safety lifecycle and the ASIL risk-
+   classification scheme.
+
+2. What is functional safety?
+   Freedom from unacceptable risk due to malfunctioning E/E systems — ensuring the
+   system behaves safely even when faults occur.
+
+3. What is ASIL?
+   Automotive Safety Integrity Level — a hazard classification (A to D) derived from
+   Severity x Exposure x Controllability. Higher ASIL = stricter safety
+   requirements. In code, models.py maps ASIL to a numeric weight (A=1...D=4, QM=0)
+   used by the scheduler.
+
+4. Difference between ASIL and QM?
+   QM (Quality Managed) items carry no ASIL safety requirement — standard quality
+   processes suffice (e.g. infotainment). ASIL items require dedicated safety
+   measures. In our system is_safety_critical is True for A-D and False for QM.
+
+5. What are ASIL-A, B, C, D?
+   Increasing integrity levels. A = lowest safety requirement, D = highest/most
+   stringent. Our workloads: AEB=D, ACC=C, LKA=C, Fusion=B, DMS=B, Surround=B,
+   Cluster=A; all infotainment/OTA = QM.
+
+6. Which is the highest safety level?
+   ASIL-D.
+
+7. Why is emergency braking ASIL-D?
+   A failure can directly cause a high-severity collision, the driver has low
+   controllability, and exposure is common — that combination yields ASIL-D. In
+   catalog.py AEB is asil="D", priority=10, deadline_ms=10 (tightest deadline).
+
+8. Why is infotainment classified as QM?
+   Its malfunction (media stutter, nav delay) does not cause direct physical harm,
+   so it needs no ASIL rating. In catalog media/nav/voice/appstore/OTA are QM.
+
+9. What happens if QM workloads affect ASIL workloads?
+   That would be a freedom-from-interference violation. We prevent it: ASIL always
+   ordered ahead of QM (effective_priority weights ASIL x 10,000) AND a 70% reserve
+   band per resource. If ASIL ever missed a deadline the dashboard shows safety
+   status VIOLATION — by design QM overload only produces DEGRADED (QM throttled).
+
+10. How do you ensure safety isolation?
+    Two mechanisms in scheduler.py: (a) strict priority ordering that serves all
+    safety-critical demand before any QM demand; (b) an asil_reserve fraction (0.7)
+    that guarantees a protected capacity band for the ASIL domain so QM can never
+    consume it. The metrics layer independently verifies asil_all_met each tick.
+
+
+================================================================================
+ 4. SCHEDULER DESIGN
+================================================================================
+
+1. How does your scheduler work?
+   Each tick: compute every workload's live demand, sort all active workloads by
+   effective_priority (safety weight, then base priority, then deadline urgency),
+   then greedily allocate each resource (CPU/GPU/NPU) down that ordered list until
+   capacity is exhausted. Then derive each workload's service ratio, latency and
+   deadline compliance. See scheduler.py: schedule().
+
+2. What inputs are considered by the scheduler?
+   Per-workload instantaneous demand per resource, ASIL level (asil_weight), base
+   priority (1-10), deadline_ms, enabled flag, the platform capacities, and the
+   asil_reserve fraction.
+
+3. How are priorities assigned?
+   effective_priority = asil_weight*10,000 + priority*100 + deadline_urgency,
+   where deadline_urgency = 1000/deadline_ms. Safety dominates, then configured
+   priority, then how tight the deadline is.
+
+4. How do you classify workloads?
+   By domain (ADAS/Cockpit/Infotainment/Connectivity) and by criticality
+   (is_safety_critical = ASIL A-D vs QM). Each has a demand vector and a per-
+   scenario intensity multiplier.
+
+5. How do you allocate CPU resources?
+   Greedy priority-ordered allocation: _allocate_resource("CPU", 900, ordered)
+   grants each workload min(its CPU demand, remaining CPU) walking down the sorted
+   list, so highest-criticality gets served first.
+
+6. How do you allocate GPU resources?
+   Identically, over the 800 CU GPU pool. GPU-heavy apps (surround-view, cluster,
+   media, lane-keeping) contend here and are served in safety-priority order.
+
+7. How do you allocate NPU resources?
+   Identically, over the 1200 CU NPU pool — this is where AI/inference apps (AEB,
+   ACC, fusion, DMS, voice) compete; safety inference is served first.
+
+8. What triggers resource reallocation?
+   Every tick (1 Hz). There is no incremental patching — the full allocation is
+   recomputed from current demand, scenario, spikes, and toggles, so it adapts
+   instantly to any change.
+
+9. How often does scheduling occur?
+   Once per simulation tick = every 1 second (SIM_INTERVAL = 1.0 in main.py). The
+   design supports a faster tick; 1 Hz is chosen for a readable live dashboard.
+
+10. Is your scheduler preemptive or non-preemptive?
+    Conceptually preemptive/priority-based: because allocation is fully recomputed
+    each tick, a newly urgent ASIL app immediately reclaims capacity from QM apps
+    (which are throttled), equivalent to preempting their share.
+
+
+================================================================================
+ 5. SCHEDULING ALGORITHM
+================================================================================
+
+1. Which scheduling algorithm did you use?
+   A custom adaptive, safety-aware, priority-greedy allocator: strict criticality
+   ordering + weighted priority + deadline-urgency tie-break + an ASIL reserve
+   band. It is a mixed-criticality static-priority scheme with graceful QM
+   degradation.
+
+2. Why did you choose it?
+   It directly guarantees freedom-from-interference (the #1 ISO 26262 concern),
+   is O(n log n) and deterministic (predictable for real-time), handles
+   heterogeneous CPU/GPU/NPU pools together, and degrades QM gracefully instead of
+   dropping safety tasks.
+
+3. Did you consider Round Robin?
+   Yes — rejected. RR is fairness-oriented and criticality-blind; it would give an
+   infotainment app equal turns against emergency braking, risking safety deadline
+   misses.
+
+4. Did you consider Earliest Deadline First?
+   Yes. EDF is optimal for single-resource deadline scheduling, but on an
+   overloaded multi-resource platform EDF can cause a cascade of misses and doesn't
+   encode safety criticality. We fold deadline urgency into our priority function
+   instead, while keeping ASIL protection dominant.
+
+5. Did you consider Rate Monotonic Scheduling?
+   Yes. RMS assigns priority by period and is great for fixed periodic tasks on one
+   CPU, but it's criticality-agnostic and single-resource. Our demand is scenario-
+   driven and spans three resource pools, so pure RMS didn't fit.
+
+6. Did you consider Weighted Fair Scheduling?
+   Yes — our reserve band is inspired by it. But pure WFS shares proportionally even
+   under overload, which could still let QM erode ASIL. We enforce hard safety
+   ordering first, then behave fair-share-like within the remaining capacity.
+
+7. What are the tradeoffs?
+   We favour safety and determinism over strict fairness and over theoretical
+   single-CPU optimality. Low-priority QM apps can be heavily throttled under load
+   (acceptable — they're non-safety). We recompute globally each tick (simple,
+   predictable) rather than doing incremental micro-optimisation.
+
+8. How do you handle starvation?
+   ASIL apps can never be starved (reserve + ordering). For QM, starvation is
+   bounded because demand fluctuates and low-priority apps still receive whatever
+   capacity remains; the dashboard surfaces throttled_count so operators see it.
+   The reserve caps how much ASIL can pre-empt, leaving room for QM when possible.
+
+9. How do you handle priority inversion?
+   There is no lock-based blocking between workloads — allocation is a stateless
+   per-tick computation, so classic priority inversion cannot occur. A high-
+   priority app never waits on a resource held by a lower-priority one.
+
+10. How do you handle deadline misses?
+    We compute latency_ms = base_latency_ms / service_ratio and flag
+    deadline_met = latency <= deadline_ms. Misses are counted (deadline_misses)
+    and drive safety_status: VIOLATION if any ASIL misses, DEGRADED if only QM
+    misses, NOMINAL otherwise. Alerts are emitted for the operator.
+
+
+================================================================================
+ 6. RESOURCE MANAGEMENT
+================================================================================
+
+CPU
+1. How is CPU utilisation measured?
+   summary["CPU"]["util"] = used / capacity, where used is the sum of CPU CU
+   granted this tick and capacity = 900. Shown as a percentage on the dashboard.
+
+2. How do you reserve CPU cores?
+   Via asil_reserve (default 0.7): reserved_asil = capacity * reserve = 630 CU of
+   CPU is treated as guaranteed for the ASIL domain, reported per resource and
+   protected by priority ordering.
+
+3. What happens if CPU reaches 100% utilisation?
+   summary marks saturated=True; QM apps get reduced service ratios (throttled),
+   their latency rises, and an alert "CPU saturated ... QM workloads throttled"
+   fires. ASIL apps remain fully served due to ordering + reserve.
+
+GPU
+1. How is GPU sharing performed?
+   The 800 CU GPU pool is allocated greedily in safety-priority order among GPU
+   consumers (cluster, surround-view, media, lane-keeping, fusion, etc.).
+
+2. How do you prevent GPU contention?
+   By ordering: safety GPU users are served before QM GPU users, and the reserve
+   keeps a protected band. Under contention QM GPU apps (media) are throttled first.
+
+3. What happens when multiple AI workloads need the GPU/accelerator?
+   They queue by effective priority; the highest-criticality inference gets full
+   allocation, lower ones share the remainder. If demand exceeds capacity, QM
+   inference is throttled and forecast/saturation alerts are raised.
+
+NPU
+1. What is an NPU?
+   Neural Processing Unit — a dedicated accelerator for neural-network inference
+   (matrix/MAC operations), far more efficient than CPU/GPU for AI workloads.
+
+2. Why use an NPU instead of a CPU?
+   Much higher performance-per-watt and lower latency for inference. Our largest
+   pool is NPU (1200 CU) because ADAS perception (AEB, fusion, ACC) and DMS/voice
+   are inference-heavy.
+
+3. Which workloads run on an NPU?
+   AEB (180), ACC (120), Lane Keeping (140), Sensor Fusion (160), DMS (150),
+   Surround (100), Voice (130), Connected Apps (20) — see demand vectors in
+   catalog.py.
+
+Memory
+1. How do you manage memory contention?
+   In this prototype the three modelled pools are CPU/GPU/NPU compute; memory is
+   abstracted into the same Compute-Unit demand model. The identical greedy-with-
+   reserve policy generalises to a memory-bandwidth pool by adding it to PLATFORM.
+
+2. How do you avoid memory exhaustion?
+   Same mechanism: cap total granted CU at capacity and reserve a safety band, so
+   the safety domain always keeps its guaranteed share and QM is throttled before
+   exhaustion harms ASIL.
+
+
+================================================================================
+ 7. SAFETY PARTITIONING
+================================================================================
+
+1. How do you isolate ASIL workloads?
+   ASIL workloads are always ordered ahead of QM (asil_weight x 10,000) and a
+   per-resource reserve band (70%) is guaranteed to them, so their allocation is
+   never reduced by QM demand.
+
+2. How do you isolate QM workloads?
+   QM apps only ever receive capacity left after safety demand is met; they operate
+   in the non-reserved band and are the first to be throttled under pressure.
+
+3. Can QM workloads access ASIL resources?
+   No. The reserved ASIL band and priority ordering ensure QM cannot consume the
+   protected safety capacity.
+
+4. What happens if QM exceeds allocated resources?
+   Its service_ratio drops below 1, latency inflates, it is flagged throttled and
+   may miss its (loose) deadline -> safety_status DEGRADED, never VIOLATION.
+
+5. How are resource quotas enforced?
+   By the scheduler's greedy allocation limited to each resource's capacity and by
+   the asil_reserve fraction. Allocation is recomputed and enforced every tick.
+
+6. Do you use containers?
+   Not in the prototype — it's a policy/orchestration engine. The design maps
+   cleanly onto containers/cgroups: each workload's allocated CU becomes a cgroup
+   CPU/GPU quota in production.
+
+7. Do you use virtual machines?
+   No VMs in the demo. In production the enforcement layer would typically be a
+   safety-certified hypervisor (e.g. partitioning per ISO 26262 / AUTOSAR Adaptive)
+   consuming our allocation decisions.
+
+8. How do you guarantee safety?
+   Deterministic priority ordering + reserved capacity band + per-tick verification
+   that asil_all_met. If ASIL is ever unsatisfiable the system flags CRITICAL,
+   making the guarantee observable and testable.
+
+9. Can ASIL workloads borrow resources from QM?
+   Yes — that's the whole point of dynamic sharing. When ASIL demand spikes (e.g.
+   emergency), it reclaims capacity that QM was using; QM is throttled to make room.
+
+10. Can QM workloads borrow resources from ASIL?
+    Only capacity outside the reserved ASIL band and only what safety apps aren't
+    currently using — and they are pre-empted the instant safety demand returns.
+    QM can never intrude on the guaranteed ASIL reserve.
+
+
+================================================================================
+ 8. REAL-TIME SYSTEMS
+================================================================================
+
+1. What is a real-time system?
+   A system whose correctness depends on producing results within defined time
+   bounds, not just logically correct outputs.
+
+2. What is a hard real-time task?
+   A task where missing a deadline is a failure/hazard (e.g. emergency braking).
+
+3. What is a soft real-time task?
+   A task where an occasional late result degrades quality but isn't catastrophic
+   (e.g. navigation, media).
+
+4. Give examples of hard real-time applications.
+   AEB (deadline 10 ms), ACC (20 ms), Lane Keeping (30 ms), Sensor Fusion (30 ms),
+   Instrument Cluster (16 ms) — all short deadlines in catalog.py.
+
+5. What is a deadline miss?
+   When a workload's response time exceeds its deadline_ms. We detect it via
+   latency_ms > deadline_ms and count/flag it.
+
+6. How do you reduce latency?
+   By guaranteeing high service ratios to critical apps (full allocation ->
+   service_ratio 1 -> latency = base_latency_ms). Throttling is pushed onto QM so
+   safety latency stays minimal.
+
+7. What is jitter?
+   Variation in response time / period between successive executions. Consistent
+   allocation each tick keeps safety-app latency stable, minimising jitter.
+
+8. How does jitter affect ADAS?
+   ADAS control loops assume regular timing; jitter degrades perception/control
+   stability and can cause unsafe behaviour. Protecting ASIL allocation keeps their
+   timing (and thus jitter) tight.
+
+9. What response time is acceptable?
+   Per-workload, defined by deadline_ms: AEB 10 ms, ACC 20 ms, cluster 16 ms, up to
+   QM apps at 100-1000 ms. Acceptable = latency within that deadline.
+
+10. How do you measure latency?
+    Queueing model: latency_ms = base_latency_ms / max(service_ratio, 0.05). Full
+    service = base latency; degraded service inflates latency proportionally.
+
+
+================================================================================
+ 9. MONITORING
+================================================================================
+
+1. How do you monitor CPU? 2. GPU? 3. Memory?
+   Every tick the simulator sums granted CU per resource and computes util,
+   asil_used, qm_used, demand and saturation flags in the summary object — streamed
+   to the dashboard for CPU, GPU and NPU (memory generalises the same way).
+
+4. How do you collect metrics?
+   simulator.step() builds a metrics block: avg_latency_ms, deadline_misses,
+   throttled_count, asil_all_met, safety_status, active_workloads, total_util.
+
+5. How frequently are metrics collected?
+   Every tick — 1 Hz (SIM_INTERVAL = 1.0s) — and pushed live over WebSocket.
+
+6. How do you detect overload?
+   Per resource, saturated = used >= capacity. Plus predictive detection:
+   predicted_util > 0.95 flags predict_saturation before it actually happens.
+
+7. How do you generate alerts?
+   The snapshot builds an alerts list: saturation ("<res> saturated ... throttled"),
+   AI forecast warnings ("approaching saturation"), and CRITICAL ASIL-exceeds-
+   capacity messages. The frontend AlertsBar renders them.
+
+8. What KPIs are displayed?
+   Per-resource utilisation, ASIL vs QM usage split, average latency, deadline
+   misses, throttled count, overall safety status, total platform utilisation, and
+   predicted demand/utilisation.
+
+9. How do you calculate utilisation?
+   Per resource: used/capacity. Overall total_util = sum(used) / sum(capacity)
+   across CPU+GPU+NPU.
+
+10. How is performance visualised?
+    React + Recharts dashboard: ResourceCards, UtilizationChart, PredictionChart,
+    MetricsSummary, WorkloadTable, SafetyPartition view and AlertsBar — all updating
+    live from the WebSocket stream.
+
+
+================================================================================
+ 10. DASHBOARD
+================================================================================
+
+1. Why is a dashboard required?
+   To make orchestration decisions and safety guarantees observable in real time
+   for operators/engineers and to demonstrate the system live.
+
+2. What information does the dashboard show?
+   Live resource utilisation, per-workload allocation/latency/deadline status,
+   safety status, alerts, AI predictions and interactive controls.
+
+3. How does it help operators?
+   It surfaces overload, throttling and safety state at a glance, and lets them
+   change scenarios, toggle workloads, inject spikes and adjust the ASIL reserve to
+   see the effect immediately.
+
+4. What charts are displayed?
+   UtilizationChart (CPU/GPU/NPU over time), PredictionChart (observed vs forecast),
+   plus MetricsSummary tiles and a per-workload table.
+
+5. How are safety violations shown?
+   Via safety_status (NOMINAL / DEGRADED / VIOLATION) and the SafetyPartition
+   component; CRITICAL alerts appear in the AlertsBar.
+
+6. How are deadline misses shown?
+   The metrics deadline_misses counter and per-row deadline_met / throttled flags
+   in the WorkloadTable.
+
+7. How do you visualise resource allocation?
+   ResourceCards and the ASIL-vs-QM usage split per resource (asil_used/qm_used),
+   showing who holds each pool.
+
+8. How do you visualise scheduling decisions?
+   The WorkloadTable shows demand vs allocated per resource and the resulting
+   service ratio, so you can see exactly what the scheduler granted and to whom.
+
+9. Can historical data be viewed?
+   Yes — time-series charts retain a rolling window of recent ticks, and the
+   predictor keeps a 40-sample history per resource.
+
+10. Can users simulate workload changes?
+    Yes — ControlPanel lets you switch driving scenario, enable/disable workloads,
+    inject demand spikes, adjust the ASIL reserve and pause/resume the simulation.
+
+
+================================================================================
+ 11. AI PREDICTION (STRETCH GOAL)
+================================================================================
+
+1. Why use AI in scheduling?
+   To act pre-emptively: forecasting the next tick's demand lets the orchestrator
+   reserve headroom BEFORE a spike causes deadline misses, instead of reacting after
+   the fact.
+
+2. What data is used for prediction?
+   The per-tick total observed demand per resource (CPU/GPU/NPU), stored in a
+   rolling 40-sample history.
+
+3. Which ML model did you use?
+   Holt's linear-trend method = double exponential smoothing (a level term + a
+   trend term). See predictor.py DemandPredictor.
+
+4. Why did you choose that model?
+   It is dependency-free pure Python, O(1) per update, runs in real time on an
+   embedded target, captures both current level and rising/falling trend, and its
+   interface can be swapped for an LSTM/Temporal-CNN without changing the system.
+
+5. What features are used?
+   The smoothed level and trend of each resource's aggregate demand time series
+   (alpha=0.4 level smoothing, beta=0.3 trend smoothing).
+
+6. How do you train the model?
+   It learns online — no offline training. Each tick update() adjusts level and
+   trend from the newest observation; it self-adapts to the current driving regime.
+
+7. What is workload prediction?
+   Forecasting near-future compute demand so the scheduler can anticipate
+   saturation and protect safety headroom proactively.
+
+8. How accurate is your prediction?
+   Reported per resource via a confidence score derived from recent relative
+   variance (confidence()): stable demand -> high confidence, volatile -> lower. The
+   PredictionChart overlays forecast vs actual so accuracy is visible.
+
+9. What happens when prediction is wrong?
+   Nothing unsafe — prediction is advisory (early-warning alerts only). Actual
+   allocation each tick is still driven by REAL measured demand with the hard safety
+   guarantees, so a bad forecast can't cause a safety violation.
+
+10. How does prediction improve performance?
+    Early saturation warnings (predicted_util > 0.95) let operators/policy shed or
+    defer QM load before a spike, reducing reactive deadline misses and smoothing
+    utilisation.
+
+
+================================================================================
+ 12. ARCHITECTURE
+================================================================================
+
+1. Explain your architecture.
+   Three layers: (a) Backend engine — Simulator drives demand, Scheduler allocates,
+   Predictor forecasts, over shared models/catalog; (b) API — FastAPI with a 1 Hz
+   background loop broadcasting JSON snapshots over WebSocket /ws (+ REST fallback);
+   (c) Frontend — React/Vite dashboard consuming the stream and sending control
+   messages.
+
+2. What are the major components?
+   models.py (data), catalog.py (platform+workloads), scheduler.py (allocation),
+   predictor.py (AI), simulator.py (tick engine), main.py (API), and the React
+   components under frontend/src.
+
+3. Why is orchestration separated from applications?
+   Separation of concerns: apps declare demand; the orchestrator owns allocation
+   policy and safety enforcement centrally. This is what makes freedom-from-
+   interference provable and the policy reusable across apps.
+
+4. How do modules communicate?
+   In-process function calls in the backend (simulator -> scheduler -> predictor);
+   backend-to-frontend via WebSocket JSON snapshots; frontend-to-backend via
+   WebSocket/REST control messages.
+
+5. How do you scale the solution?
+   Stateless per-tick scheduling and a clean interface let you add resources to
+   PLATFORM, add workloads to the catalog, raise the tick rate, or replace the
+   predictor — without touching the core loop.
+
+6. Is the architecture modular?
+   Yes — each concern is its own module with narrow interfaces (e.g. schedule()
+   takes workloads+platform+reserve and returns a summary), so components are
+   independently replaceable.
+
+7. Which component makes decisions?
+   scheduler.py (schedule / effective_priority / _allocate_resource).
+
+8. Which component collects metrics?
+   simulator.py (_build_snapshot assembles resources, metrics and alerts).
+
+9. Which component enforces safety?
+   scheduler.py via priority ordering + asil_reserve; simulator verifies
+   asil_all_met and sets safety_status.
+
+10. Which component handles prediction?
+    predictor.py (DemandPredictor).
+
+
+================================================================================
+ 13. DESIGN DECISIONS
+================================================================================
+
+1. Why did you choose this architecture?
+   A clean split between a deterministic policy core and a live visualisation makes
+   the safety behaviour easy to reason about, test and demo, while keeping each part
+   swappable.
+
+2. Why did you use microservices?
+   We deliberately did NOT — for a real-time control loop, in-process calls avoid
+   network latency/jitter. Backend and frontend are separate processes, which is
+   enough separation here.
+
+3. Why did you use a monolithic (single-process) backend?
+   The scheduler must run deterministically at a fixed cadence; a single-process
+   engine gives predictable timing with no inter-service overhead — appropriate for
+   an embedded orchestration layer.
+
+4. Why React?
+   Component model fits a live dashboard, huge ecosystem (Recharts for charts,
+   lucide-react for icons), and efficient re-rendering for streaming data.
+
+5. Why FastAPI?
+   Async-first (ideal for WebSocket streaming + background tasks), automatic
+   validation via Pydantic, minimal boilerplate, and high performance.
+
+6. Why PostgreSQL?
+   Not used in the demo (state is live/in-memory). If persistence were needed
+   (historical metrics, audit of safety events), PostgreSQL is the natural choice
+   for reliable relational time-series/event storage.
+
+7. Why WebSockets?
+   The dashboard needs low-latency push of 1 Hz snapshots; WebSockets give
+   bidirectional streaming (server pushes state, client sends controls) without
+   polling overhead. REST endpoints exist as a fallback.
+
+8. Why not Kubernetes?
+   K8s orchestrates cloud containers at second/minute granularity — the wrong tool
+   for millisecond in-vehicle real-time scheduling. Our layer is the vehicle-side
+   equivalent; K8s could manage a cloud/backoffice twin, not the safety loop.
+
+9. What would you change in production?
+   Bind allocations to a real enforcement layer (certified hypervisor / cgroups /
+   AUTOSAR Adaptive), add persistence + auth, run at higher tick rate, replace the
+   predictor with a trained model, and add formal timing/WCET analysis.
+
+10. What are the design tradeoffs?
+    Simplicity/determinism/safety over micro-optimised fairness; simulation over
+    real silicon enforcement; a lightweight statistical predictor over a heavy ML
+    model. These keep the safety story clear and the demo real-time.
+
+
+================================================================================
+ 14. SCENARIO-BASED
+================================================================================
+
+Scenario 1 — Emergency braking starts suddenly (scenario="emergency")
+1. What happens in your system?
+   AEB intensity jumps to 2.0x (plus other ADAS rise); its high ASIL-D effective
+   priority means it's allocated first, reclaiming CPU/NPU from QM apps, which are
+   throttled. Safety status stays NOMINAL for ASIL.
+2. How quickly are resources reallocated?
+   Within one tick — allocation is fully recomputed each cycle, so the shift is
+   immediate on the next scheduling pass.
+3. Which workloads are reduced first?
+   Lowest effective priority first: QM apps — Connected Apps, OTA, Media, Voice,
+   Navigation — before any ASIL app is touched.
+
+Scenario 2 — Voice assistant consumes 90% GPU/accelerator
+1. How does the system react?
+   Voice is QM (priority 4); it only holds capacity ASIL apps aren't using. As ADAS
+   demand rises, voice is throttled back down its service ratio.
+2. Does it impact ADAS?
+   No — ASIL ordering + the 70% reserve guarantee ADAS gets its capacity first; the
+   scheduler pre-empts the QM voice app.
+3. How do you prevent unsafe behaviour?
+   Priority ordering + reserved ASIL band; the metrics layer confirms asil_all_met
+   and would flag VIOLATION if safety were ever affected (it isn't).
+
+Scenario 3 — CPU utilisation reaches 100%
+1. How does your scheduler respond?
+   summary marks CPU saturated; safety apps keep full CPU, QM apps get reduced
+   service ratios (throttled), and a saturation alert is raised.
+2. Which workloads are suspended/reduced?
+   The lowest-priority QM CPU consumers first (Connected Apps, OTA, Media, Nav).
+   ASIL apps are never suspended.
+3. How do you maintain safety?
+   The ASIL reserve + ordering ensure safety CPU demand is met before any QM
+   allocation; safety_status remains NOMINAL as long as ASIL deadlines hold.
+
+Scenario 4 — NPU failure occurs
+1. How does the system recover?
+   Modelled by dropping the NPU pool capacity; the scheduler re-allocates the
+   reduced NPU among workloads in safety-priority order, protecting critical
+   inference (AEB, fusion) first.
+2. Is there a fallback mechanism?
+   In this prototype, degraded-capacity handling: safety inference retains priority
+   and QM inference is dropped. A production fallback would migrate inference to GPU/
+   CPU — the abstract Compute-Unit model makes that reassignment natural.
+3. What workload is migrated?
+   Safety-critical inference (AEB/ACC/fusion) is preserved/migrated first; non-
+   safety NPU users (voice, connected apps) are shed.
+
+
+================================================================================
+ 15. PERFORMANCE
+================================================================================
+
+1. What performance improvements did you achieve?
+   Versus static worst-case partitioning, dynamic pooling keeps utilisation high
+   while guaranteeing zero ASIL deadline violations — demonstrated live as
+   safety_status stays NOMINAL for ASIL even under emergency load.
+
+2. How much latency reduction was observed?
+   Safety apps run at base latency (service_ratio 1) instead of being blocked by
+   QM contention; QM latency rises only under overload, exactly as intended.
+
+3. How much resource utilisation improved?
+   total_util (sum used / sum capacity) trends much higher than fixed partitioning
+   because idle capacity is immediately reused — visible on the UtilizationChart.
+
+4. How many workloads can be supported?
+   12 in the demo across all domains; the catalog and platform are data-driven, so
+   more can be added without code changes.
+
+5. How many scheduling decisions per second?
+   A full platform re-allocation every tick (1 Hz here); the algorithm is
+   O(n log n) and can run far faster if the tick rate is increased.
+
+6. What is the scheduler overhead?
+   Minimal — a sort plus three linear passes over the workload list per tick; pure
+   Python and effectively negligible for 12 workloads.
+
+7. What is the memory footprint?
+   Tiny: a handful of dataclasses per workload plus a 40-sample history per
+   resource in the predictor; runs comfortably in an embedded footprint.
+
+8. What is the response time?
+   Per workload, latency_ms from the queueing model, bounded by its deadline_ms
+   when served fully (e.g. AEB ~5 ms base).
+
+9. How do you benchmark the system?
+   By running scenarios (idle/city/highway/parking/emergency) and spikes and
+   observing utilisation, deadline_misses, throttled_count and safety_status on the
+   dashboard.
+
+10. What metrics prove success?
+    asil_all_met = True under all scenarios (no ASIL VIOLATION), high total_util,
+    and QM-only throttling under overload.
+
+
+================================================================================
+ 16. EDGE CASES
+================================================================================
+
+1. What happens if every application is high priority?
+   The tie-break chain still totally orders them (ASIL weight, then priority, then
+   deadline urgency), so allocation stays deterministic; safety-critical still wins.
+
+2. What happens if resources are exhausted?
+   Greedy allocation stops at capacity; safety demand is served first, QM is
+   throttled, saturation alerts fire — graceful degradation, not collapse.
+
+3. What if monitoring data is incorrect?
+   Allocation uses the reported demand, but the independent asil_all_met check and
+   CRITICAL alert (ASIL demand > capacity) catch impossible/inconsistent states.
+
+4. What if the scheduler crashes?
+   The FastAPI background loop is isolated; the last good snapshot is retained
+   (_last_snapshot) and served, and uvicorn --reload restarts the process. In
+   production a watchdog would fail the platform to a safe state.
+
+5. What if a workload becomes unresponsive?
+   Modelled by disabling it (enabled=False) -> zero demand; it simply drops out of
+   allocation without affecting others.
+
+6. What if all GPUs are occupied?
+   GPU saturates -> QM GPU users throttled first; safety GPU users keep their
+   reserved share; a saturation alert is raised.
+
+7. What if prediction fails?
+   Prediction is advisory only; allocation still runs on measured demand with full
+   safety guarantees, so a predictor failure never causes a safety issue.
+
+8. What if latency exceeds threshold?
+   deadline_met flips False, deadline_misses increments, and safety_status becomes
+   DEGRADED (QM) or VIOLATION (ASIL) with an alert.
+
+9. What if safety partitioning fails?
+   The system makes it observable: if ASIL demand can't be met, it emits
+   "CRITICAL: ASIL demand exceeds capacity" and sets VIOLATION — the trigger for a
+   real vehicle's fail-safe.
+
+10. What is the fail-safe mechanism?
+    Conceptually: keep the last safe allocation, protect the ASIL reserve, and
+    surface VIOLATION/CRITICAL so the vehicle can enter a safe state (e.g. shed QM,
+    degrade features). Safety apps are structurally guaranteed first claim on
+    compute.
+
+
+================================================================================
+ 17. FUTURE ENHANCEMENTS
+================================================================================
+
+1. How would you deploy this in real vehicles?
+   Run the policy core on the HPC/domain controller and bind allocations to a
+   certified hypervisor / AUTOSAR Adaptive / cgroups enforcement layer, with real
+   telemetry replacing the simulator.
+
+2. How could Kubernetes be integrated?
+   For a cloud/back-office digital twin and fleet analytics — not the in-vehicle
+   real-time loop. K8s could manage off-board services that consume vehicle data.
+
+3. How would edge AI improve scheduling?
+   On-device models could predict demand and driver intent more accurately,
+   enabling smarter pre-emptive reservation than the current statistical forecaster.
+
+4. How would reinforcement learning help?
+   An RL agent could learn allocation/reserve policies that maximise utilisation
+   subject to zero-safety-violation constraints, adapting per driving context.
+
+5. How would you support autonomous vehicles?
+   Add heavier perception/planning workloads and tighter deadlines; the reserve and
+   priority model scales to guarantee their compute while sharing spare capacity.
+
+6. How would you make scheduling self-learning?
+   Feed observed deadline outcomes back to tune priorities, reserve fraction and
+   forecast parameters online (closing the loop around the predictor).
+
+7. How would cloud connectivity help?
+   Fleet-wide learning, remote monitoring, and pushing improved policies/models via
+   OTA to every vehicle.
+
+8. How would OTA updates fit into the architecture?
+   OTA is already modelled as a low-priority QM workload; the same channel would
+   deploy updated scheduling policies/predictor models safely during idle periods.
+
+9. How would digital twins improve validation?
+   Replay real drive data through this exact engine to validate policy changes and
+   certify safety behaviour before deployment.
+
+10. What would your Version 2 include?
+    Real enforcement backend, trained ML predictor, memory/bandwidth pools, RL-tuned
+    policy, persistence + auth, higher tick rate, and formal WCET/timing analysis.
+
+
+================================================================================
+ TOP 15 MOST-LIKELY JUDGE QUESTIONS (CRISP ANSWERS)
+================================================================================
+
+1. What problem are you solving?
+   Safely and efficiently sharing one centralised vehicle computer among mixed-
+   criticality apps (ASIL + QM) so safety apps never miss deadlines while
+   utilisation stays high.
+
+2. Why can't static allocation work?
+   It reserves worst-case slices that sit idle (wasteful) and can't shift capacity
+   when a safety app suddenly needs more — so you over-provision AND still risk
+   misses.
+
+3. What is ASIL and QM?
+   ASIL A-D = automotive safety integrity levels (D highest) requiring safety
+   measures; QM = quality-managed, no safety requirement. Our AEB=D, infotainment=QM.
+
+4. How do you guarantee ASIL workloads are protected?
+   Strict ordering (ASIL weight x 10,000 dominates) + a 70% per-resource reserve
+   band + per-tick asil_all_met verification, so QM can never starve ASIL.
+
+5. How does the adaptive scheduler work?
+   Each 1 Hz tick: measure demand, sort by effective priority (safety, priority,
+   deadline urgency), greedily allocate CPU/GPU/NPU top-down, then derive service
+   ratio/latency/deadline status.
+
+6. How do you allocate CPU/GPU/NPU resources?
+   Independent greedy allocation per pool (900/800/1200 CU) in the same safety-
+   priority order; each app gets min(demand, remaining).
+
+7. What happens during emergency braking?
+   AEB demand jumps 2x; as ASIL-D it's served first within one tick, reclaiming
+   compute from throttled QM apps — safety stays NOMINAL.
+
+8. How do you prevent resource starvation?
+   ASIL can't be starved (reserve+ordering); QM starvation is bounded, gets leftover
+   capacity, and is surfaced via throttled_count.
+
+9. What scheduling algorithm and why?
+   Custom mixed-criticality static-priority greedy allocator with deadline-urgency
+   tie-break and ASIL reserve — chosen for provable freedom-from-interference,
+   determinism, and multi-resource support (vs RR/EDF/RMS/WFS which we evaluated).
+
+10. How do you measure latency?
+    latency_ms = base_latency_ms / service_ratio; deadline_met = latency <=
+    deadline_ms.
+
+11. How do you detect overload conditions?
+    used >= capacity -> saturated flag + alert; plus AI forecast flags predicted_util
+    > 0.95 before it happens.
+
+12. What metrics are on the dashboard?
+    Per-resource utilisation, ASIL/QM split, avg latency, deadline misses, throttled
+    count, safety status, total utilisation, and predicted demand.
+
+13. How does AI prediction help?
+    Holt double-EWMA forecasts next-tick demand so the system warns of saturation
+    early and can protect headroom pre-emptively; it's advisory, never overriding
+    safety.
+
+14. What makes you different from existing schedulers?
+    Standard schedulers are criticality-blind and single-resource; ours enforces ISO
+    26262 freedom-from-interference across CPU+GPU+NPU with graceful QM degradation
+    and AI-assisted foresight.
+
+15. How would this scale to a real SDV?
+    Data-driven catalog/platform (add apps/resources freely), stateless fast
+    scheduling, and a clean interface to bind onto a certified hypervisor/cgroups
+    enforcement layer with OTA-updatable policies.
+
+================================================================================
+ END OF ANSWER SHEET
+================================================================================

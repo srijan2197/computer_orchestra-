@@ -28,7 +28,8 @@ def _allocate_resource(resource: str, capacity: float, ordered: List[RuntimeWork
 
 def schedule(workloads: List[RuntimeWorkload], platform: Dict[str, float], asil_reserve: float = 0.7) -> dict:
     active = [w for w in workloads if w.spec.enabled]
-    ordered = sorted(active, key=effective_priority, reverse=True)
+    asil_workers = sorted([w for w in active if w.spec.is_safety_critical], key=effective_priority, reverse=True)
+    qm_workers = sorted([w for w in active if not w.spec.is_safety_critical], key=effective_priority, reverse=True)
 
     summary: Dict[str, dict] = {}
 
@@ -36,10 +37,13 @@ def schedule(workloads: List[RuntimeWorkload], platform: Dict[str, float], asil_
         asil_demand = sum(w.demand.get(resource, 0.0) for w in active if w.spec.is_safety_critical)
         qm_demand = sum(w.demand.get(resource, 0.0) for w in active if not w.spec.is_safety_critical)
 
-        used = _allocate_resource(resource, capacity, ordered)
+        asil_pool = capacity * asil_reserve
+        qm_pool = capacity - asil_pool
 
-        asil_used = sum(w.allocated.get(resource, 0.0) for w in active if w.spec.is_safety_critical)
-        qm_used = sum(w.allocated.get(resource, 0.0) for w in active if not w.spec.is_safety_critical)
+        asil_used = _allocate_resource(resource, asil_pool, asil_workers)
+        leftover = asil_pool - asil_used
+        qm_used = _allocate_resource(resource, qm_pool + leftover, qm_workers)
+        used = asil_used + qm_used
 
         summary[resource] = {
             "capacity": round(capacity, 1),

@@ -73,7 +73,7 @@ WORKLOADS: List[WorkloadSpec] = [
         id="voice", name="Voice Assistant", domain="Infotainment", asil="QM",
         priority=4, deadline_ms=200, base_latency_ms=60,
         demand={"CPU": 90, "GPU": 0, "NPU": 130},
-        intensity={"idle": 0.4, "city": 0.8, "highway": 0.8, "parking": 0.4, "emergency": 0.5},
+          intensity={"idle": 0.4, "city": 0.8, "highway": 0.8, "parking": 0.4, "emergency": 0.5},
     ),
     WorkloadSpec(
         id="ota", name="OTA Update Agent", domain="Connectivity", asil="QM",

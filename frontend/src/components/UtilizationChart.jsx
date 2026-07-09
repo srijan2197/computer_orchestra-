@@ -2,8 +2,9 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 
 const TT = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null
+  const light = document.documentElement.classList.contains('light')
   return (
-    <div className="bg-panel border border-edge rounded-lg px-3 py-2 text-[11px]">
+    <div className="card border px-3 py-2 text-[11px]" style={{ background: light ? '#fff' : '#111827', borderColor: light ? '#e2e8f0' : '#1f2937' }}>
       <div className="text-slate-400 mb-1">tick {label}</div>
       {payload.map((p) => (
         <div key={p.name} style={{ color: p.color }} className="font-mono">{p.name}: {p.value}%</div>
@@ -13,6 +14,8 @@ const TT = ({ active, payload, label }) => {
 }
 
 export default function UtilizationChart({ history }) {
+  const light = document.documentElement.classList.contains('light')
+  const gridColor = light ? '#cbd5e1' : '#1f2937'
   return (
     <div className="card p-4">
       <h2 className="font-semibold text-sm mb-2">Real-Time Utilisation (CPU / GPU / NPU)</h2>
@@ -26,7 +29,7 @@ export default function UtilizationChart({ history }) {
               </linearGradient>
             ))}
           </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+          <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
           <XAxis dataKey="tick" stroke="#475569" tick={{ fontSize: 10 }} />
           <YAxis domain={[0, 100]} stroke="#475569" tick={{ fontSize: 10 }} />
           <Tooltip content={<TT />} />

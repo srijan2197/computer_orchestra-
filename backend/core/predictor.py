@@ -43,3 +43,4 @@ class DemandPredictor:
         var = sum((x - mean) ** 2 for x in recent) / len(recent)
         rel = (var ** 0.5) / mean
         return round(max(0.1, min(0.99, 1.0 - rel)), 2)
+

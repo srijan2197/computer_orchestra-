@@ -1,4 +1,4 @@
-import { Cpu, Activity, ShieldCheck, ShieldAlert, ShieldX, Wifi, WifiOff } from 'lucide-react'
+import { Cpu, Activity, ShieldCheck, ShieldAlert, ShieldX, Wifi, WifiOff, Sun, Moon } from 'lucide-react'
 import MadBuddiesMascot from './MadBuddiesMascot'
 
 const STATUS = {
@@ -7,7 +7,7 @@ const STATUS = {
   VIOLATION: { label: 'SAFETY VIOLATION', cls: 'text-rose-400', Icon: ShieldX, ring: 'bg-rose-500/15 border-rose-500/40' },
 }
 
-export default function Header({ snapshot, connected }) {
+export default function Header({ snapshot, connected, light, onToggleTheme }) {
   const status = snapshot?.metrics?.safety_status || 'NOMINAL'
   const s = STATUS[status] || STATUS.NOMINAL
   const S = s.Icon
@@ -37,6 +37,12 @@ export default function Header({ snapshot, connected }) {
             <p className="text-sm font-bold text-indigo-300 tracking-wide">Mad_buddies</p>
           </div>
         </div>
+
+        <button onClick={onToggleTheme} title="Toggle light/dark mode"
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-edge bg-panel hover:border-slate-500 transition">
+          {light ? <Moon className="w-4 h-4 text-indigo-400" /> : <Sun className="w-4 h-4 text-amber-400" />}
+          <span className="text-xs text-slate-400">{light ? 'Dark' : 'Light'}</span>
+        </button>
 
         <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border ${s.ring}`}>
           <S className={`w-4 h-4 ${s.cls}`} />

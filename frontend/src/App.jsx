@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import Header from './components/Header'
 import MetricsSummary from './components/MetricsSummary'
 import ResourceCard from './components/ResourceCard'
@@ -12,6 +13,11 @@ import { Loader2 } from 'lucide-react'
 
 export default function App() {
   const { snapshot, connected, history, send } = useOrchestrator()
+  const [light, setLight] = useState(false)
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('light', light)
+  }, [light])
 
   if (!snapshot) {
     return (
@@ -30,7 +36,7 @@ export default function App() {
 
   return (
     <div className="min-h-full flex flex-col">
-      <Header snapshot={snapshot} connected={connected} />
+      <Header snapshot={snapshot} connected={connected} light={light} onToggleTheme={() => setLight(l => !l)} />
 
       <main className="flex-1 p-4 md:p-6 space-y-4">
         <MetricsSummary metrics={snapshot.metrics} />

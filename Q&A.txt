@@ -1,0 +1,225 @@
+================================================================================
+ CROSS-DOMAIN SOFTWARE ORCHESTRATION LAYER — HACKATHON Q&A
+ 20 Hot Questions Judges / Reviewers May Ask (with crisp answers)
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. Q: In one line, what does your project do?
+--------------------------------------------------------------------------------
+A: It is a software orchestration layer that dynamically allocates CPU/GPU/NPU
+   compute on a shared vehicle SoC across applications based on their priority,
+   functional-safety level (ASIL vs QM) and real-time load — instead of the
+   traditional static, fixed partitioning.
+
+
+--------------------------------------------------------------------------------
+2. Q: What real problem are you solving?
+--------------------------------------------------------------------------------
+A: Modern cars consolidate many functions onto a few High-Performance Compute
+   (HPC) SoCs. Static allocation wastes silicon (idle GPU can't help a saturated
+   NPU), adds latency, and makes it risky to run safety-critical (ASIL) and
+   non-safety (QM) workloads together. A braking function must NEVER be starved
+   by infotainment. We make sharing safe AND efficient.
+
+
+--------------------------------------------------------------------------------
+3. Q: What is ASIL and QM, and why do they matter here?
+--------------------------------------------------------------------------------
+A: ASIL (Automotive Safety Integrity Level, A→D per ISO 26262) classifies how
+   safety-critical a function is; D is the highest (e.g., emergency braking).
+   QM = "Quality Managed" — no safety requirement (e.g., media, app store).
+   They matter because mixed-criticality on shared hardware requires "freedom
+   from interference": QM must never degrade an ASIL function's timing.
+
+
+--------------------------------------------------------------------------------
+4. Q: How does your scheduler actually decide who gets compute?
+--------------------------------------------------------------------------------
+A: Every tick it computes an "effective priority" for each workload:
+     effective_priority = ASIL_weight*10000 + base_priority*100 + deadline_urgency
+   ASIL weight dominates (safety first), then base priority, then how tight the
+   deadline is. It then allocates each resource greedily in that order, giving
+   each workload up to its demand until capacity is exhausted. See
+   scheduler.py -> effective_priority() and _allocate_resource().
+
+
+--------------------------------------------------------------------------------
+5. Q: How exactly do you guarantee ASIL workloads are never starved?
+--------------------------------------------------------------------------------
+A: Two mechanisms: (1) Strict priority ordering — all safety-critical workloads
+   are allocated before any QM workload, so QM only ever gets leftover capacity.
+   (2) A configurable "ASIL reserve" band per resource that is guaranteed to the
+   safety domain. QM can borrow idle capacity but can never preempt ASIL. Under
+   overload only QM is throttled, so ASIL deadlines keep being met. Our tests
+   show asil_all_met = True across idle/city/highway/parking/emergency.
+
+
+--------------------------------------------------------------------------------
+6. Q: What happens when the platform is overloaded?
+--------------------------------------------------------------------------------
+A: Graceful degradation. QM workloads are THROTTLED (they get a fraction of
+   demand, so their latency rises), not dropped, and never the ASIL ones. The
+   system reports a safety status: NOMINAL (all deadlines met) -> DEGRADED (some
+   QM deadlines missed, ASIL safe) -> VIOLATION (platform physically can't meet
+   ASIL demand — a genuine "hardware undersized" alarm).
+
+
+--------------------------------------------------------------------------------
+7. Q: How do you model latency, and how is a "deadline miss" detected?
+--------------------------------------------------------------------------------
+A: We use a queueing-style model. Each workload has a base latency when fully
+   served. When its service ratio (allocated/demand, bottlenecked across the
+   resources it needs) drops below 1, latency inflates as base_latency / ratio.
+   deadline_met = (latency <= deadline_ms). This makes throttling visibly hurt
+   QM latency while ASIL stays within its deadline.
+
+
+--------------------------------------------------------------------------------
+8. Q: Why CPU, GPU AND NPU separately? Why not just "compute"?
+--------------------------------------------------------------------------------
+A: Automotive workloads are heterogeneous: vision/AI runs on the NPU, rendering
+   (cluster, surround view) on the GPU, control logic on the CPU. A workload can
+   be bottlenecked on one resource while others sit idle. Treating them
+   separately is exactly what lets us reclaim wasted capacity — and its service
+   ratio is the MIN across the resources it needs (the true bottleneck).
+
+
+--------------------------------------------------------------------------------
+9. Q: Tell me about the AI-driven workload prediction (your stretch goal).
+--------------------------------------------------------------------------------
+A: An online forecaster (Holt's method: exponentially-weighted level + linear
+   trend) predicts next-tick demand per resource, one step ahead, with a
+   confidence score. The orchestrator uses it to warn of saturation BEFORE it
+   causes deadline misses — the dashboard resource cards and prediction charts
+   turn amber pre-emptively. It's pure-Python and dependency-free so it can run
+   in real time on an embedded target. See predictor.py -> DemandPredictor.
+
+
+--------------------------------------------------------------------------------
+10. Q: Why not a heavier ML model like an LSTM?
+--------------------------------------------------------------------------------
+A: For a hackathon prototype the Holt forecaster is fast, explainable, needs no
+    training data, and runs anywhere. Crucially, the predictor is behind a clean
+    interface (update() -> forecast) so DemandPredictor can be swapped for an
+    LSTM/Temporal-CNN later WITHOUT touching the scheduler. It's an architecture
+    decision, not a limitation.
+
+
+--------------------------------------------------------------------------------
+11. Q: Is this real hardware or a simulation?
+--------------------------------------------------------------------------------
+A: It's a physics-light simulation of a shared SoC so we can demo the
+    orchestration logic without target hardware. Importantly, the scheduler and
+    predictor are the "real" parts — the same scheduler.py interface (workloads,
+    demands, capacities -> allocations) could drive a real hypervisor or OS
+    partition/cgroup manager. The simulator just feeds it realistic load.
+
+
+--------------------------------------------------------------------------------
+12. Q: Walk me through the architecture / data flow.
+--------------------------------------------------------------------------------
+A: Backend (FastAPI): simulator.py generates per-workload demand for the current
+    driving scenario -> scheduler.py allocates CPU/GPU/NPU safety-first ->
+    predictor.py forecasts next tick -> a JSON snapshot is built. A background
+    task ticks this at 1 Hz and broadcasts each snapshot over a WebSocket (/ws).
+    Frontend (React + Vite + Tailwind + Recharts) subscribes, keeps a rolling
+    history, and renders gauges, the safety-partition view, utilisation/latency
+    charts, prediction charts and controls. Controls (scenario, reserve, spike,
+    toggle) are sent back over the same WebSocket.
+
+
+--------------------------------------------------------------------------------
+13. Q: Why WebSockets instead of REST polling?
+--------------------------------------------------------------------------------
+A: The dashboard is a live, real-time control-room view updating every second
+    for many clients. WebSockets give low-latency server push and bidirectional
+    control on one connection. We still expose REST /state and /control as a
+    fallback for polling or scripting.
+
+
+--------------------------------------------------------------------------------
+14. Q: What are the driving scenarios and why include them?
+--------------------------------------------------------------------------------
+A: idle (parked), city, highway, parking, emergency. Each reshapes the load
+    profile via per-workload intensity multipliers — e.g., surround-view/parking
+    assist spikes GPU during parking; emergency braking + sensor fusion spike in
+    an emergency. They prove the scheduler adapts to changing real-time load, and
+    let judges see NOMINAL -> DEGRADED transitions live.
+
+
+--------------------------------------------------------------------------------
+15. Q: Show me it works — what's your proof / demo moment?
+--------------------------------------------------------------------------------
+A: Switch to the "Emergency" scenario: total platform utilisation jumps to ~99%,
+    QM apps (media, OTA, app store) get throttled and start missing deadlines
+    (status = DEGRADED), but every ASIL workload still meets its deadline
+    (asil_all_met = True). Then hit a workload's spike button to push into a
+    VIOLATION alarm. That single interaction demonstrates adaptivity + the safety
+    guarantee + graceful degradation.
+
+
+--------------------------------------------------------------------------------
+16. Q: How is this better than a fixed/static partition or a hypervisor today?
+--------------------------------------------------------------------------------
+A: Static partitions size each domain for its worst case, so most silicon sits
+    idle most of the time and you still can't share a spare accelerator. We keep
+    the SAME safety guarantee (ASIL reserve + strict priority) but let QM
+    opportunistically use idle capacity, raising utilisation and lowering QM
+    latency in normal conditions — without ever compromising ASIL timing.
+
+
+--------------------------------------------------------------------------------
+17. Q: What are the units? What is a "Compute Unit"?
+--------------------------------------------------------------------------------
+A: We normalise heterogeneous silicon into abstract Compute Units (CU) so one
+    engine can reason about CPU cores, GPU shaders and NPU MACs uniformly. The
+    platform has a CU capacity per resource (e.g., CPU 900, GPU 800, NPU 1200)
+    and each workload declares a CU demand per resource. In production these map
+    to real utilisation percentages / core-shares.
+
+
+--------------------------------------------------------------------------------
+18. Q: What are the failure modes and safety edge cases you handle?
+--------------------------------------------------------------------------------
+A: (a) Total ASIL demand exceeds capacity -> flagged as VIOLATION with a
+    CRITICAL alert (honest: the hardware is undersized, don't hide it).
+    (b) Predicted saturation -> early amber warning before misses occur.
+    (c) A disabled/failed workload frees its capacity instantly for others.
+    (d) Reconnect logic on the frontend if the WebSocket drops. Latency never
+    goes infinite because the service ratio is floored.
+
+
+--------------------------------------------------------------------------------
+19. Q: How would you productionise this / what's next?
+--------------------------------------------------------------------------------
+A: Bind the scheduler to a real hypervisor or Linux cgroups/SCHED_DEADLINE and
+    accelerator drivers; add energy- and thermal-aware scheduling; per-core
+    affinity and NUMA awareness; ASIL decomposition; hardware-in-the-loop
+    testing; and replace the forecaster with a trained LSTM/TCN using logged
+    fleet telemetry. The interfaces are already designed for these swaps.
+
+
+--------------------------------------------------------------------------------
+20. Q: What's the tech stack and why did you choose it?
+--------------------------------------------------------------------------------
+A: Backend: FastAPI + Uvicorn + WebSockets + Pydantic — async, fast, great for
+    real-time streaming, minimal boilerplate; the scheduler/predictor are pure
+    Python (embeddable, no heavy deps). Frontend: React 18 + Vite (instant HMR) +
+    Tailwind CSS (fast, consistent UI) + Recharts (declarative real-time charts)
+    + lucide-react icons. Chosen for rapid iteration and a polished, demo-ready
+    control-room dashboard.
+
+
+================================================================================
+ BONUS 30-SECOND ELEVATOR PITCH
+================================================================================
+"Cars now run dozens of functions — from emergency braking to Netflix — on the
+ same chip. Today that compute is statically partitioned, which is wasteful and
+ hard to keep safe. Our Cross-Domain Orchestration Layer dynamically shares
+ CPU, GPU and NPU based on each app's priority and safety level, guarantees
+ safety-critical (ASIL) work is never starved by best-effort (QM) work, gracefully
+ throttles under overload, and uses AI to predict load spikes before they hurt.
+ The result: higher utilisation, lower latency, and provable safety — shown live
+ on a real-time dashboard."
+================================================================================

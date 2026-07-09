@@ -1,0 +1,14 @@
+# Python
+backend/venv/
+backend/__pycache__/
+backend/core/__pycache__/
+*.pyc
+*.pyo
+
+# Node
+frontend/node_modules/
+
+# Misc
+.DS_Store
+*.log
+nohup.out

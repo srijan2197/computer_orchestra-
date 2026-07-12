@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from .catalog import PLATFORM, fresh_catalog
 from .models import Resource, RuntimeWorkload, WorkloadSpec
 from .predictor import DemandPredictor
+from .ml_model import DeadlineMissPredictor
 from .scheduler import schedule
 
 
@@ -21,7 +22,8 @@ class Simulator:
         self.tick: int = 0
         self.running: bool = True
         self._spikes: Dict[str, float] = {}
-        self.predictor = DemandPredictor([r.value for r in Resource])
+        self.predictor  = DemandPredictor([r.value for r in Resource])
+        self.rf_model   = DeadlineMissPredictor()
         self._last_snapshot: Optional[dict] = None
 
     def set_scenario(self, scenario: str) -> None:
@@ -73,6 +75,7 @@ class Simulator:
             for r in self.platform
         }
         forecast = self.predictor.update(observed)
+        self.rf_model.predict(runtime)
 
         snapshot = self._build_snapshot(runtime, summary, observed, forecast)
         self._last_snapshot = snapshot
@@ -94,7 +97,10 @@ class Simulator:
                 "predicted_util": round(pred_util, 3),
                 "predict_saturation": saturated_soon,
                 "predict_confidence": self.predictor.confidence(r),
+                "anomaly": self.predictor.anomalies.get(r, False),
             }
+            if self.predictor.anomalies.get(r, False):
+                alerts.append(f"AI anomaly detected on {r} — abnormal demand spike")
             if s["saturated"]:
                 alerts.append(f"{r} saturated at {int(s['util']*100)}% — QM workloads throttled")
             elif saturated_soon:
@@ -128,6 +134,19 @@ class Simulator:
             ),
         }
 
+        # Attach RF miss-probability to each workload dict
+        workloads_out = []
+        for rt in runtime:
+            d = rt.to_dict()
+            d["miss_prob"] = self.rf_model.probabilities.get(rt.spec.id, 0.0)
+            workloads_out.append(d)
+
+        # High-risk alerts from RF model
+        for rt in [w for w in runtime if w.spec.enabled]:
+            prob = self.rf_model.probabilities.get(rt.spec.id, 0.0)
+            if prob > 0.75 and rt.spec.is_safety_critical:
+                alerts.append(f"ML: {rt.spec.name} has {int(prob*100)}% deadline-miss risk")
+
         return {
             "tick": self.tick,
             "timestamp": round(time.time(), 3),
@@ -136,8 +155,9 @@ class Simulator:
             "asil_reserve": self.asil_reserve,
             "platform": {r: round(c, 1) for r, c in self.platform.items()},
             "resources": resources,
-            "workloads": [rt.to_dict() for rt in runtime],
-            "metrics": metrics,
+            "workloads": workloads_out,
+            "metrics": {**metrics, "rf_ready": self.rf_model.ready,
+                        "rf_importance": self.rf_model.feature_importance()},
             "alerts": alerts,
         }
 

@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import Header from './components/Header'
 import MetricsSummary from './components/MetricsSummary'
-import ResourceCard from './components/ResourceCard'
+import ResourceGraph from './components/ResourceGraph'
+import CarBlueprint from './components/CarBlueprint'
 import SafetyPartition from './components/SafetyPartition'
 import WorkloadTable from './components/WorkloadTable'
 import UtilizationChart from './components/UtilizationChart'
@@ -42,20 +43,29 @@ export default function App() {
         <MetricsSummary metrics={snapshot.metrics} />
         <AlertsBar alerts={snapshot.alerts} />
 
+        {/* Resource graphs — CPU / GPU / NPU with live charts */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {Object.entries(resources).map(([name, data]) => (
+            <ResourceGraph key={name} name={name} data={data} history={history} />
+          ))}
+        </div>
+
+        {/* Car Blueprint — full width */}
+        <CarBlueprint
+          workloads={snapshot.workloads}
+          resources={resources}
+          scenario={snapshot.scenario}
+        />
+
+        {/* Bottom section */}
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
           <div className="xl:col-span-2 space-y-4">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {Object.entries(resources).map(([name, data]) => (
-                <ResourceCard key={name} name={name} data={data} />
-              ))}
-            </div>
             <UtilizationChart history={history} />
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <PredictionChart history={history} resource="CPU" />
               <PredictionChart history={history} resource="NPU" />
             </div>
           </div>
-
           <div className="space-y-4">
             <ControlPanel snapshot={snapshot} onControl={control} />
             <SafetyPartition resources={resources} reserve={snapshot.asil_reserve} />

@@ -1,0 +1,24 @@
+# This is an example configuration file
+# To learn more, see the full config.yaml reference: https://docs.continue.dev/reference
+
+name: my config
+version: 1.0.0
+schema: v1
+
+# Define which models can be used
+# https://docs.continue.dev/customization/models
+models:
+  - name: GPT-5 Codex (APIM)
+    provider: openai
+    model: gpt-5.3-codex
+    apiBase: https://apim-foundry-prod-ltts.azure-api.net/codex
+    apiKey: 710e010e2d39488b9d397b68c30cbd52
+    useResponseApi: true
+    roles:
+      - chat
+      - edit
+      - autocomplete
+      - apply
+    capabilities:
+      - tool_use
+      - image_input

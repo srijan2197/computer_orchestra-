@@ -29,6 +29,7 @@ export default function WorkloadTable({ workloads, onSpike, onToggle }) {
               <th className="px-1 font-medium">Service</th>
               <th className="px-1 font-medium">Latency</th>
               <th className="px-1 font-medium">Deadline</th>
+              <th className="px-1 font-medium">ML Risk</th>
               <th className="px-1 font-medium text-right">Actions</th>
             </tr>
           </thead>
@@ -57,6 +58,15 @@ export default function WorkloadTable({ workloads, onSpike, onToggle }) {
                     <span className={`font-mono text-[11px] ${w.deadline_met ? 'text-emerald-400' : 'text-rose-400'}`}>
                       {w.deadline_met ? '✓' : '✗'} {w.deadline_ms}ms
                     </span>
+                  </td>
+                  <td className="px-1">
+                    {(() => {
+                      const p = Math.round((w.miss_prob ?? 0) * 100)
+                      const color = p >= 75 ? 'text-rose-400' : p >= 40 ? 'text-amber-400' : 'text-emerald-400'
+                      return w.miss_prob != null
+                        ? <span className={`font-mono text-[11px] font-semibold ${color}`}>{p}%</span>
+                        : <span className="text-slate-600 text-[10px]">—</span>
+                    })()}
                   </td>
                   <td className="px-1">
                     <div className="flex items-center justify-end gap-1">
